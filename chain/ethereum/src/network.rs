@@ -1,5 +1,6 @@
 use anyhow::{anyhow, bail, Context};
 use graph::cheap_clone::CheapClone;
+use graph::firehose::SubgraphLimit;
 use graph::prelude::rand::{self, seq::IteratorRandom};
 use std::cmp::Ordering;
 use std::collections::HashMap;
@@ -20,7 +21,7 @@ pub struct EthereumNetworkAdapter {
     /// strong_count on `adapter` to determine whether the adapter is above
     /// that limit. That's a somewhat imprecise but convenient way to
     /// determine the number of connections
-    limit: usize,
+    limit: SubgraphLimit,
 }
 
 impl EthereumNetworkAdapter {
@@ -56,7 +57,11 @@ impl EthereumNetworkAdapters {
         self.adapters
             .iter()
             .filter(move |adapter| Some(&adapter.capabilities) == cheapest_sufficient_capability)
-            .filter(|adapter| Arc::strong_count(&adapter.adapter) < adapter.limit)
+            .filter(|adapter| {
+                adapter
+                    .limit
+                    .has_capacity(Arc::strong_count(&adapter.adapter))
+            })
             .map(|adapter| adapter.adapter.cheap_clone())
     }
 
@@ -115,7 +120,10 @@ impl EthereumNetworkAdapters {
 
         // TODO: This will probably blow up a lot sooner than [limit] amount of
         // subgraphs, since we probably use a few instances.
-        if Arc::strong_count(&adapters.adapter) >= adapters.limit {
+        if !adapters
+            .limit
+            .has_capacity(Arc::strong_count(&adapters.adapter))
+        {
             bail!("call only adapter has reached the concurrency limit");
         }
 
@@ -142,7 +150,7 @@ impl EthereumNetworks {
         name: String,
         capabilities: NodeCapabilities,
         adapter: Arc<EthereumAdapter>,
-        limit: usize,
+        limit: SubgraphLimit,
     ) {
         let network_adapters = self
             .networks
@@ -213,7 +221,7 @@ impl EthereumNetworks {
 mod tests {
     use std::sync::Arc;
 
-    use graph::{prelude::MetricsRegistry, tokio, url::Url};
+    use graph::{firehose::SubgraphLimit, prelude::MetricsRegistry, tokio, url::Url};
     use graph_mock::MockMetricsRegistry;
     use http::HeaderMap;
 
@@ -320,7 +328,7 @@ mod tests {
                     traces: false,
                 },
                 eth_call_adapter.clone(),
-                3,
+                SubgraphLimit::Limit(3),
             );
             ethereum_networks.insert(
                 chain.clone(),
@@ -329,7 +337,7 @@ mod tests {
                     traces: false,
                 },
                 eth_adapter.clone(),
-                3,
+                SubgraphLimit::Limit(3),
             );
             ethereum_networks.networks.get(&chain).unwrap().clone()
         };
@@ -374,5 +382,73 @@ mod tests {
                 .unwrap();
             assert_eq!(adapter.is_call_only(), false);
         }
+    }
+
+    #[tokio::test]
+    async fn adapter_selector_uses_zero_as_unlimited() {
+        let chain = "mainnet".to_string();
+        let logger = graph::log::logger(true);
+        let mock_registry: Arc<dyn MetricsRegistry> = Arc::new(MockMetricsRegistry::new());
+        let transport =
+            Transport::new_rpc(Url::parse("http://127.0.0.1").unwrap(), HeaderMap::new());
+        let provider_metrics = Arc::new(ProviderEthRpcMetrics::new(mock_registry.clone()));
+
+        let eth_call_adapter = Arc::new(
+            EthereumAdapter::new(
+                logger.clone(),
+                String::new(),
+                "http://127.0.0.1",
+                transport.clone(),
+                provider_metrics.clone(),
+                true,
+                true,
+            )
+            .await,
+        );
+
+        let eth_adapter = Arc::new(
+            EthereumAdapter::new(
+                logger.clone(),
+                String::new(),
+                "http://127.0.0.1",
+                transport.clone(),
+                provider_metrics.clone(),
+                true,
+                false,
+            )
+            .await,
+        );
+
+        let adapters = {
+            let mut ethereum_networks = EthereumNetworks::new();
+            ethereum_networks.insert(
+                chain.clone(),
+                NodeCapabilities {
+                    archive: true,
+                    traces: false,
+                },
+                eth_call_adapter.clone(),
+                SubgraphLimit::Unlimited,
+            );
+            ethereum_networks.insert(
+                chain.clone(),
+                NodeCapabilities {
+                    archive: true,
+                    traces: false,
+                },
+                eth_adapter.clone(),
+                SubgraphLimit::Limit(3),
+            );
+            ethereum_networks.networks.get(&chain).unwrap().clone()
+        };
+        // one reference above and one inside adapters struct
+        assert_eq!(Arc::strong_count(&eth_call_adapter), 2);
+        assert_eq!(Arc::strong_count(&eth_adapter), 2);
+
+        let keep: Vec<Arc<EthereumAdapter>> = vec![0; 10]
+            .iter()
+            .map(|_| adapters.call_or_cheapest(None).unwrap())
+            .collect();
+        assert_eq!(keep.iter().any(|a| !a.is_call_only()), false);
     }
 }
