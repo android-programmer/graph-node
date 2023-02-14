@@ -97,9 +97,12 @@ impl EthereumNetworkAdapters {
         &self,
         capabilities: Option<&NodeCapabilities>,
     ) -> anyhow::Result<Arc<EthereumAdapter>> {
-        match self.call_only_adapter()? {
-            Some(adapter) => Ok(adapter),
-            None => self.cheapest_with(capabilities.unwrap_or(&NodeCapabilities {
+        // call_only_adapter can fail if we're out of capcity or,this is fine since
+        // we would want to fallback onto a full adapter
+        // so we will ignore this error and return whatever comes out of `cheapest_with`
+        match self.call_only_adapter() {
+            Ok(Some(adapter)) => Ok(adapter),
+            _ => self.cheapest_with(capabilities.unwrap_or(&NodeCapabilities {
                 // Archive is required for call_only
                 archive: true,
                 traces: false,
@@ -368,7 +371,10 @@ mod tests {
         {
             let adapter = adapters.call_or_cheapest(None).unwrap();
             assert!(adapter.is_call_only());
-            assert!(adapters.call_or_cheapest(None).is_err());
+            assert_eq!(
+                adapters.call_or_cheapest(None).unwrap().is_call_only(),
+                false
+            );
         }
 
         // Check empty falls back to call only
@@ -385,7 +391,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn adapter_selector_uses_zero_as_unlimited() {
+    async fn adapter_selector_unlimited() {
         let chain = "mainnet".to_string();
         let logger = graph::log::logger(true);
         let mock_registry: Arc<dyn MetricsRegistry> = Arc::new(MockMetricsRegistry::new());
@@ -450,5 +456,114 @@ mod tests {
             .map(|_| adapters.call_or_cheapest(None).unwrap())
             .collect();
         assert_eq!(keep.iter().any(|a| !a.is_call_only()), false);
+    }
+
+    #[tokio::test]
+    async fn adapter_selector_disable_call_only_fallback() {
+        let chain = "mainnet".to_string();
+        let logger = graph::log::logger(true);
+        let mock_registry: Arc<dyn MetricsRegistry> = Arc::new(MockMetricsRegistry::new());
+        let transport =
+            Transport::new_rpc(Url::parse("http://127.0.0.1").unwrap(), HeaderMap::new());
+        let provider_metrics = Arc::new(ProviderEthRpcMetrics::new(mock_registry.clone()));
+
+        let eth_call_adapter = Arc::new(
+            EthereumAdapter::new(
+                logger.clone(),
+                String::new(),
+                "http://127.0.0.1",
+                transport.clone(),
+                provider_metrics.clone(),
+                true,
+                true,
+            )
+            .await,
+        );
+
+        let eth_adapter = Arc::new(
+            EthereumAdapter::new(
+                logger.clone(),
+                String::new(),
+                "http://127.0.0.1",
+                transport.clone(),
+                provider_metrics.clone(),
+                true,
+                false,
+            )
+            .await,
+        );
+
+        let adapters = {
+            let mut ethereum_networks = EthereumNetworks::new();
+            ethereum_networks.insert(
+                chain.clone(),
+                NodeCapabilities {
+                    archive: true,
+                    traces: false,
+                },
+                eth_call_adapter.clone(),
+                SubgraphLimit::Disabled,
+            );
+            ethereum_networks.insert(
+                chain.clone(),
+                NodeCapabilities {
+                    archive: true,
+                    traces: false,
+                },
+                eth_adapter.clone(),
+                SubgraphLimit::Limit(3),
+            );
+            ethereum_networks.networks.get(&chain).unwrap().clone()
+        };
+        // one reference above and one inside adapters struct
+        assert_eq!(Arc::strong_count(&eth_call_adapter), 2);
+        assert_eq!(Arc::strong_count(&eth_adapter), 2);
+        assert_eq!(
+            adapters.call_or_cheapest(None).unwrap().is_call_only(),
+            false
+        );
+    }
+
+    #[tokio::test]
+    async fn adapter_selector_no_call_only_fallback() {
+        let chain = "mainnet".to_string();
+        let logger = graph::log::logger(true);
+        let mock_registry: Arc<dyn MetricsRegistry> = Arc::new(MockMetricsRegistry::new());
+        let transport =
+            Transport::new_rpc(Url::parse("http://127.0.0.1").unwrap(), HeaderMap::new());
+        let provider_metrics = Arc::new(ProviderEthRpcMetrics::new(mock_registry.clone()));
+
+        let eth_adapter = Arc::new(
+            EthereumAdapter::new(
+                logger.clone(),
+                String::new(),
+                "http://127.0.0.1",
+                transport.clone(),
+                provider_metrics.clone(),
+                true,
+                false,
+            )
+            .await,
+        );
+
+        let adapters = {
+            let mut ethereum_networks = EthereumNetworks::new();
+            ethereum_networks.insert(
+                chain.clone(),
+                NodeCapabilities {
+                    archive: true,
+                    traces: false,
+                },
+                eth_adapter.clone(),
+                SubgraphLimit::Limit(3),
+            );
+            ethereum_networks.networks.get(&chain).unwrap().clone()
+        };
+        // one reference above and one inside adapters struct
+        assert_eq!(Arc::strong_count(&eth_adapter), 2);
+        assert_eq!(
+            adapters.call_or_cheapest(None).unwrap().is_call_only(),
+            false
+        );
     }
 }
